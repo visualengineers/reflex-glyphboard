@@ -52,7 +52,7 @@ export class GlyphplotEventController {
 
   /**
    * When the mousewheel is rotated on the canvas, update the transform of the viewport by updating
-   * glyph posititions according to the new transform.
+   * glyph positions according to the new transform.
    */
   public onZoomed(event: any): void {
     if (this.component.drawLock) { return; }
@@ -103,6 +103,18 @@ export class GlyphplotEventController {
       this.component.animate();
     }
   }
+
+  // public computeZoom() {
+  //   const trans = event.transform;
+  //   trans.x = this.saveStartTransform.x + event.transform.x - this.saveEndTransform.x;
+  //   trans.y = this.saveStartTransform.y + event.transform.y - this.saveEndTransform.y;
+  //   this.component.configuration.zoomIdentity = trans;
+  //   this.formerTranslation.x = this.component.configuration.zoomIdentity.x / this.component.configuration.zoomIdentity.k;
+  //   this.formerTranslation.y = this.component.configuration.zoomIdentity.y / this.component.configuration.zoomIdentity.k;
+  //   this.selectionEnded = true;
+  //   this.configuration.updateCurrentLevelOfDetail(this.component.configuration.zoomIdentity.k);
+  //   this.configuration.currentLayout = GlyphLayout.Cluster;
+  // }
 
   /**
    * When a new drag event is started, stop the collision simulation and set the starting values of
@@ -253,6 +265,8 @@ export class GlyphplotEventController {
    * @param e mouse move event
    */
   public onMouseMove(e: MouseEvent): void {
+
+
     if (this.cursor.isVisible && !this.cursor.isFixed && this.component.tooltip !== undefined) {
       this.cursor.position = { left: e.clientX, top: e.clientY };
       this.component.tooltip.isVisible = false;
@@ -279,7 +293,7 @@ export class GlyphplotEventController {
       } else {
         this.configuration.idOfHoveredGlyph = 0;
       }
-      for (const element of this.component.data.positions) {
+      for (const element of this.component.data?.positions) {
         if (
           Math.abs(element.position.x - e.clientX) <= glyphRadius &&
           Math.abs(element.position.y - e.clientY) <= glyphRadius
@@ -448,7 +462,7 @@ export class GlyphplotEventController {
   };
 
   private manualZoom = (payload: any[]) => {
-    
+
     var newValue = payload[0];
     if (this.component.uniqueID == payload[1]) {
       this.component.configuration.zoomIdentity.x = (this.component.width - this.component.width * newValue) / 2 + this.formerTranslation.x * newValue;

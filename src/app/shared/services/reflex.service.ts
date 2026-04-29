@@ -1,0 +1,330 @@
+import { Injectable } from '@angular/core';
+import { Logger } from './logger.service';
+import { environment } from 'src/environments/environment';
+import { BehaviorSubject, combineLatest, filter, interval, Observable, take } from 'rxjs';
+import { ExtremumType, InteractiveTouchPoint, TouchInteractionMode, TouchPoint3d, TouchPointVelocityDescription, TouchPointVelocityMap } from '../data/reflex.references';
+import { EventAggregatorService } from '../events/event-aggregator.service';
+import { FitToScreenEvent } from '../events/fit-to-screen.event';
+import { DiagnosticsService } from './diagnostics.service';
+import { DiagnosticsData } from '../util/diagnostics-data.interface';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class ReFlexService {
+
+  private rawTouchPoints= new BehaviorSubject<Array<TouchPoint3d>>([]);
+  private interactions = new BehaviorSubject<Array<InteractiveTouchPoint>>([]);
+  private isConnected = new BehaviorSubject<boolean>(false);
+  private eventCount = new BehaviorSubject<number>(0);
+
+  private velocities: Array<TouchPointVelocityMap> = [];
+  private stopProcessing = false;
+
+  private lastInteraction: TouchInteractionMode = TouchInteractionMode.None;
+
+  public get currentTouches$(): Observable<Array<TouchPoint3d>> {
+    return this.rawTouchPoints.asObservable();
+  }
+
+  public get isConnected$(): Observable<boolean> {
+    return this.isConnected.asObservable();
+  }
+
+  public get interactions$(): Observable<Array<InteractiveTouchPoint>> {
+    return this.interactions.asObservable();
+  }
+
+  public constructor(
+    private readonly logger: Logger,
+    private readonly eventAggregator: EventAggregatorService,
+    private readonly diagnosticsService: DiagnosticsService
+  ) {
+    combineLatest([interval(environment.reflexReconnectInterval), this.isConnected$])
+    .pipe(
+      filter(([t, isConnected]) => {
+        return !isConnected;
+      })
+    ).subscribe(() => {
+      this.connectToWebSocket();
+    });
+  }
+
+  public connectToWebSocket() {
+    try {
+      const websocket = new WebSocket (environment.reflexAddress);
+      const that = this;
+
+      websocket.onopen = (e: any) => {
+        that.isConnected.next(true);
+      };
+
+      websocket.onmessage = (e: any) => {
+        that.eventCount.next(that.eventCount.getValue() + 1);
+        try {
+          const data = JSON.parse(e.data) as Array<TouchPoint3d>;
+          that.processMessage(data);
+        } catch (error) {
+          this.logger.log(`${error}`);
+        }
+      };
+
+      websocket.onerror = function (e) {
+        that.isConnected.next(false);
+      };
+
+      websocket.onclose = function (e) {
+        that.isConnected.next(false);
+      };
+    } catch (err) {
+      this.logger.log('No Flexiwall Connection found.');
+      this.isConnected.next(false);
+    }
+  }
+
+  private processMessage(touchPoints: Array<TouchPoint3d>): void {
+    if (this.stopProcessing) {
+      return;
+    }
+
+    const result: Array<InteractiveTouchPoint> = [];
+
+    const validPoints = touchPoints.filter((tp) => tp.Position.IsValid && !tp.Position.IsFiltered);
+
+    this.rawTouchPoints.next(validPoints);
+
+    const confidentPoints = validPoints.filter((tp) => tp.Confidence > environment.reflexMinConfidence && tp.ExtremumDescription.Type !== ExtremumType.Undefined);
+
+    this.updateVelocities(confidentPoints);
+
+    const resetDetected = this.analyzeVelocities();
+
+    if (resetDetected) {
+      this.velocities = [];
+
+      this.interactions.next([]);
+
+      this.eventAggregator.getEvent(FitToScreenEvent).publish(true);
+
+      this.stopProcessing = true;
+
+      interval(environment.reflexDebounceTimeForReset).pipe(
+        take(1)
+      ).subscribe({
+        next: () => this.stopProcessing = false
+      });
+
+      const diagnosticsData: DiagnosticsData = {
+        eventTypeDescription: 'Gestures: Reset'
+      }
+      this.diagnosticsService.submit(diagnosticsData);
+
+      return;
+    }
+
+    // find points with depth value lower than info threshold --> these are used for hovering
+    const infoPoints = confidentPoints
+      .filter((tp) => Math.abs(tp.Position.Z) < environment.reflexInfoDepthThreshold)
+      .map((tp) => ({ originalPoint: tp, mode: TouchInteractionMode.Info, strength: 1, rotation: 0 }))
+      .sort((tp1, tp2) => tp1.originalPoint.Position.Z - tp2.originalPoint.Position.Z)
+      .slice(0, environment.reflexMaxInfoPanels);
+
+    result.push(...infoPoints);
+
+    // only log interaction changes
+    if (infoPoints.length > 0 && this.lastInteraction !== TouchInteractionMode.Info) {
+      infoPoints.forEach((tp) => {
+        const diagnosticsData: DiagnosticsData = {
+          eventTypeDescription: 'Gestures: Info',
+          data1: `${tp.mode}`,
+          data2: `${tp.strength}`,
+          remarks: `${tp.originalPoint.TouchId}|${tp.originalPoint.Confidence}|[${tp.originalPoint.Position.X}, ${tp.originalPoint.Position.Y}, ${tp.originalPoint.Position.Z}]`
+        };
+
+        this.diagnosticsService.submit(diagnosticsData);
+      });
+
+      this.lastInteraction = TouchInteractionMode.Info;
+    }
+
+    // all points with higher depth value
+    let remainingPoints = confidentPoints.filter((tp) => Math.abs(tp.Position.Z) >= environment.reflexInfoDepthThreshold);
+
+    // single  touch: zoom (no parallel hover + zoom; prevents also issues when adding the second finger for panning causing unwanted zoom actione)
+    if (confidentPoints.length === 1 && remainingPoints.length === 1) {
+      const interaction: InteractiveTouchPoint =
+      {
+        originalPoint: remainingPoints[0],
+        mode: remainingPoints[0].Position.Z < 0
+          ? TouchInteractionMode.ZoomIn
+          : TouchInteractionMode.ZoomOut,
+        strength: this.computeStrengthForZoom(remainingPoints[0]),
+        rotation: 0
+      };
+
+      result.push(interaction);
+
+      if (this.lastInteraction !== interaction.mode) {
+
+        const diagnosticsData: DiagnosticsData = {
+          eventTypeDescription: 'Gestures: Zoom',
+          data1: `${interaction.mode}`,
+          data2: `${interaction.strength}`,
+          remarks: `${interaction.originalPoint.TouchId}|${interaction.originalPoint.Confidence}|[${interaction.originalPoint.Position.X}, ${interaction.originalPoint.Position.Y}, ${interaction.originalPoint.Position.Z}]`
+        }
+        this.diagnosticsService.submit(diagnosticsData);
+
+        this.lastInteraction = interaction.mode;
+      }
+    }
+
+    if (remainingPoints.length > 2) {
+      remainingPoints = this.selectSignificantPoints(remainingPoints);
+    }
+
+    remainingPoints = remainingPoints.sort((tp1, tp2) => Math.abs(tp2.Position.Z) - Math.abs(tp1.Position.Z));
+
+    if (remainingPoints.length === 2) {
+      const anchor: InteractiveTouchPoint =
+      {
+        originalPoint: remainingPoints[1],
+        mode: TouchInteractionMode.PanAnchor,
+        strength: 0,
+        rotation: 0
+      };
+      const direction: InteractiveTouchPoint =
+      {
+        originalPoint: remainingPoints[0],
+        mode: TouchInteractionMode.PanDirection,
+        strength: this.computeStrengthForZoom(remainingPoints[0]),
+        rotation: this.computeRotation(remainingPoints[1], remainingPoints[0])
+      }
+
+      result.push(anchor);
+      result.push(direction);
+
+      if (this.lastInteraction !== TouchInteractionMode.PanAnchor) {
+        const diagnosticsData_anchor: DiagnosticsData = {
+          eventTypeDescription: 'Gestures: Pan(Anchor)',
+          data1: `${anchor.mode}`,
+          data2: `${anchor.strength}`,
+          remarks: `${anchor.originalPoint.TouchId}|${anchor.originalPoint.Confidence}|[${anchor.originalPoint.Position.X}, ${anchor.originalPoint.Position.Y}, ${anchor.originalPoint.Position.Z}]`
+        }
+        this.diagnosticsService.submit(diagnosticsData_anchor);
+
+        const diagnosticsData_direction: DiagnosticsData = {
+          eventTypeDescription: 'Gestures: Pan(Direction)',
+          data1: `${direction.mode}`,
+          data2: `${direction.strength}|${direction.rotation}`,
+          remarks: `${direction.originalPoint.TouchId}|${direction.originalPoint.Confidence}|[${direction.originalPoint.Position.X}, ${direction.originalPoint.Position.Y}, ${direction.originalPoint.Position.Z}]`
+        }
+        this.diagnosticsService.submit(diagnosticsData_direction);
+
+        this.lastInteraction = TouchInteractionMode.PanAnchor;
+      }
+    }
+
+    this.interactions.next(result);
+
+    if (result.length === 0) {
+      this.lastInteraction = TouchInteractionMode.None;
+    }
+  }
+
+  private selectSignificantPoints(touchPoints: Array<TouchPoint3d>): Array<TouchPoint3d> {
+
+    if (touchPoints.length <=2) {
+      return touchPoints;
+    }
+
+    return touchPoints
+    // create tuples of { touchPoint, distanceToAllOtherPoints }
+    .map((tp) => {
+      // createList with other points
+      const other = touchPoints.filter((p) => p.TouchId !== tp.TouchId);
+
+      // compute sum of distances to that points
+      const totalDistance = other.map((o) => this.distance(tp, o)).reduce((sum, current) => sum + current, 0);
+
+      return { point: tp, dist: totalDistance };
+    })
+    // sort by this distance
+    .sort((tp1, tp2) => tp1.dist - tp2.dist)
+    // take the first two elements
+    .slice(0,2)
+    // map back to original point
+    .map((tp) => tp.point);
+  }
+
+  private distance(src: TouchPoint3d, dest: TouchPoint3d): number {
+    return Math.abs(dest.Position.X - src.Position.X) + Math.abs(dest.Position.Y - src.Position.Y);
+  }
+
+  private computeStrengthForZoom(touchPoint: TouchPoint3d): number {
+    let scaledZoomRange = Math.max(1 - environment.reflexInfoDepthThreshold, 0.001);
+
+    return (Math.abs(touchPoint.Position.Z) - environment.reflexInfoDepthThreshold) / scaledZoomRange;
+  }
+
+  private computeRotation(anchor: TouchPoint3d, target: TouchPoint3d) {
+    const direction = { x: target.Position.X - anchor.Position.X, y: target.Position.Y - anchor.Position.Y };
+
+    const xDir = { x: 1, y: 0 };
+
+    const angleRad = Math.atan2(direction.y*xDir.x - direction.x*xDir.y, direction.x*xDir.x + direction.y*xDir.y);
+
+    const angleDegree = (angleRad * 180) / Math.PI;
+
+    return angleDegree;
+  }
+
+  private updateVelocities(confidentPoints: Array<TouchPoint3d>) : void {
+    // remove all points with too high confidence
+    const still_ok = confidentPoints.filter((p) => p.Confidence < environment.reflexMaxConfidence);
+
+    // remove all points that are not in the list anymore
+    this.velocities = this.velocities.filter((value) => still_ok.find((p) => p.TouchId === value.touchId) !== undefined);
+
+    const new_values = still_ok.map((p) => ({ touchId: p.TouchId, confidence: p.Confidence, zValue: p.Position.Z }));
+
+    this.velocities.push(...new_values);
+  }
+
+  private analyzeVelocities(): boolean {
+    const ids = [...new Set(this.velocities.map((p) => p.touchId))];
+
+    let result = false;
+
+    ids.forEach((id) => {
+      const velocity = this.computeMaxVelocity(id);
+
+      if (velocity.pos > environment.reflexResetVelocityThreshold && Math.abs(velocity.neg) > environment.reflexResetVelocityThreshold) {
+        result = true;
+        return;
+      }
+
+    });
+
+    return result;
+  }
+
+  private computeMaxVelocity(id: number): TouchPointVelocityDescription {
+    const sorted = this.velocities.filter((p) => p.touchId === id).sort((p1, p2) => p1.confidence -p2.confidence);
+    let result: TouchPointVelocityDescription = {
+      pos: 0,
+      neg: 0
+    };
+
+    for (let i = 0; i < sorted.length-1; i++) {
+      const diff = sorted[i+1].zValue - sorted[i].zValue;
+
+      if (diff > 0) {
+        result.pos += diff;
+      } else {
+        result.neg += diff;
+      }
+    }
+
+    return result;
+  }
+}

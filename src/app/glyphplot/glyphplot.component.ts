@@ -25,6 +25,7 @@ import * as d3 from 'd3';
 import { GlyphplotLayoutController } from './glyphplot.layout.controller';
 import { GlyphLayout } from 'src/app/glyph/glyph.layout';
 import { DotGlyphConfiguration } from 'src/app/glyph/glyph.dot.configuration';
+import { ReFlexService } from '../shared/services/reflex.service';
 
 @Component({
   selector: 'app-glyphplot',
@@ -35,6 +36,10 @@ export class GlyphplotComponent implements OnInit, OnChanges {
   @ViewChild('chart', { static: false }) public chartContainer: ElementRef | undefined;
   @ViewChild('selectionrectangle') public selectionRectangle: ElementRef | undefined;
   @ViewChild('tooltip') public tooltip: TooltipComponent | undefined;
+  @ViewChild('tooltip1') public tooltip1: TooltipComponent | undefined;
+  @ViewChild('tooltip2') public tooltip2: TooltipComponent | undefined;
+  @ViewChild('tooltip3') public tooltip3: TooltipComponent | undefined;
+
   @Input() width: number = 0;
   @Input() height: number = 0;
 
@@ -103,7 +108,9 @@ export class GlyphplotComponent implements OnInit, OnChanges {
     private helper: Helper,
     private configurationService: Configuration,
     private cursor: LenseCursor,
-    private eventAggregator: EventAggregatorService
+    private eventAggregator: EventAggregatorService,
+    private reflex: ReFlexService
+
   ) {
     this._configuration = this.configurationService.addConfiguration();
     this._circle = new DotGlyph(this.context, 0, new DotGlyphConfiguration());
@@ -119,8 +126,10 @@ export class GlyphplotComponent implements OnInit, OnChanges {
     this._flexiWallController = new FlexiWallController(
       this,
       this.logger,
+      this.reflex,
       this.cursor,
-      this.configuration
+      this.configuration,
+      this.eventAggregator
     );
     this._layoutController = new GlyphplotLayoutController(
       this,
@@ -130,7 +139,7 @@ export class GlyphplotComponent implements OnInit, OnChanges {
     this.configuration.leftSide = this.configurationService.configurations.length === 1;
     if (this.configuration.leftSide) {
       // Flexiwall connection only for first glyphboard component
-      this._flexiWallController.doWebSocket();
+      this._flexiWallController.init();
     }
     this._uniqueID = Math.random()
       .toString(36)
@@ -184,7 +193,11 @@ export class GlyphplotComponent implements OnInit, OnChanges {
     this.selectionContext = this.selectionRectangle?.nativeElement.getContext('2d');
 
     this.context = element.getContext('2d');
-    if(this.tooltip !== undefined) this.tooltip.data = this.data;
+    this.allToolTips.forEach((toolTip) => {
+      if(toolTip !== undefined) {
+        toolTip.data = this.data;
+      }
+    });
 
     this.currentLayout = this.configuration.currentLayout;
     const colorFeature = this.data.schema.color;
@@ -245,6 +258,8 @@ export class GlyphplotComponent implements OnInit, OnChanges {
       .attr('width', this.width)
       .attr('height', this.height)
       .call(this.zoom);
+
+    //  console.log(this.height, this.width, this.zoom);
     // const selection = d3
     //   .select(rectangle)
     //   .style('left', this.configuration.leftSide ? '0' : this.width)
@@ -634,5 +649,8 @@ export class GlyphplotComponent implements OnInit, OnChanges {
   get dataUpdated() { return this._dataUpdated; }
   set dataUpdated(value: boolean) { this._dataUpdated = value; }
   get uniqueID() {return this._uniqueID; }
+  get allToolTips(): Array<TooltipComponent | undefined> {
+    return [ this.tooltip, this.tooltip1, this.tooltip2, this.tooltip3 ]
+  }
   //#endregion
 }

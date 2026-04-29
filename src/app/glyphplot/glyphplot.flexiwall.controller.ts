@@ -3,121 +3,186 @@ import { LenseCursor } from '../lense/cursor.service';
 import { ConfigurationData } from '../shared/services/configuration.data';
 import { Logger } from 'src/app/shared/services/logger.service';
 import { GlyphLayout } from '../glyph/glyph.layout';
+import { InteractiveTouchPoint, TouchInteractionMode } from '../shared/data/reflex.references';
+import { ReFlexService } from '../shared/services/reflex.service';
+import { Injectable, OnDestroy } from '@angular/core';
+import { debounceTime, Subscription } from 'rxjs';
+import * as d3 from 'd3';
+import { EventAggregatorService } from '../shared/events/event-aggregator.service';
+import { FitToScreenEvent } from '../shared/events/fit-to-screen.event';
 
-export class FlexiWallController {
+@Injectable()
+export class FlexiWallController implements OnDestroy {
 
-  private urlFlexiwall = 'ws://localhost:8080/Broadcast';
+  private subscriptions = new Subscription();
 
-  private flexiLastX: number = 0;
-  private flexiLastY: number = 0;
-  private flexiLastZ: number = 0;
+  private readonly panningSpeed = -15;
+  private readonly wheelModifier = -20;
 
-  private eventCount = 0;
+  private lastInteraction = TouchInteractionMode.None;
+
+  private isReset = true;
 
   constructor(private component: GlyphplotComponent,
     private logger: Logger,
+    private reflex: ReFlexService,
     private cursor: LenseCursor,
-    private configuration: ConfigurationData) {
+    private configuration: ConfigurationData,
+    private eventAggregator: EventAggregatorService
+  ) {
   }
 
   /**
    * Connect to Flexiwall Socket if present.
    * @return {void}
    */
-  public doWebSocket(): void {
-    try {
-      const websocket = new WebSocket (this.urlFlexiwall);
-      const component = this.component;
-      const that = this;
+  public init(): void {
+    const connectionSub = this.reflex.isConnected$.subscribe({
+      next: (isConnected) => this.component.suppressAnimations = isConnected,
+      complete: () => this.component.suppressAnimations = false,
+      error:() => this.component.suppressAnimations = false
+    });
 
-      websocket.onopen = (e: any) => {
-        component.suppressAnimations = true;
-      };
+    const interactionSub = this.reflex.interactions$.pipe(
+      debounceTime(20)
+    ).subscribe({
+      next: (interactions) => this.handleInteractions(interactions)
+    });
 
-      websocket.onmessage = (e: any) => {
-        that.eventCount++;
-        // if (that.eventCount > 5)
-        {
-          that.onMessage (e);
-          that.eventCount = 0;
-        }
-      };
+    this.subscriptions.add(connectionSub);
+    this.subscriptions.add(interactionSub);
 
-      websocket.onerror = function (e) {
-        component.suppressAnimations = false;
-      };
+    this.eventAggregator
+      .getEvent(FitToScreenEvent)
+      .subscribe(() => this.resetTransformation());
+  };
 
-      websocket.onclose = function (e) {
-        component.suppressAnimations = false;
-      };
-    } catch (err) {
-      this.logger.log('No Flexiwall Connection found.');
-    }
+  public ngOnDestroy(): void {
+      this.subscriptions.unsubscribe();
   }
 
-  onMessage (event: any) {
-    const data = JSON.parse(event.data);
-    // if (data.Position.Z > 1300 || data.Position.Z < 1500) return;
-    // this.logger.log("X " + data.Position.X + " Y " + data.Position.Y + " Z " + data.Position.Z);
 
-    // Find out if there is a minimal push on the wall
-    // Move the lense
-    // if (data.Position.Z < -0.5 && this.cursor.isVisible)
-    if (data.Position.Z < 1300 && this.cursor.isVisible) {
-      let deltaX = 0;
-      let deltaY = 0;
-      const moveX = Math.abs(this.flexiLastX - data.Position.X);
-      const moveY = Math.abs(this.flexiLastY - data.Position.Y);
-      // if (Math.abs(this.flexiLastX - data.Position.X) > 0.002)
-      {
-        deltaX = this.flexiLastX > data.Position.X ? moveX : -1 * moveX;
-      }
-      // if (Math.abs(this.flexiLastY - data.Position.Y) > 0.002)
-      {
-        deltaY = this.flexiLastY > data.Position.Y ? moveY : -1 * moveY;
-      }
 
-      const oldPosition = this.cursor.position;
-      this.cursor.updateGlyphs = true;
-      const newPosition = {
-        left: oldPosition.left + deltaX,
-        top: oldPosition.top + deltaY
-      };
-      this.cursor.position = newPosition;
+  private handleInteractions(interactions: Array<InteractiveTouchPoint>): void {
+    const zoom = interactions.find((i) => i.mode === TouchInteractionMode.ZoomIn || i.mode === TouchInteractionMode.ZoomOut);
+    const anchor = interactions.find((i) => i.mode === TouchInteractionMode.PanAnchor);
+    const target = interactions.find((i) => i.mode === TouchInteractionMode.PanDirection);
+    const info = interactions.filter((i) => i.mode === TouchInteractionMode.Info);
 
-      this.flexiLastZ = data.Position.Z;
-      this.flexiLastY = data.Position.Y;
-      this.flexiLastX = data.Position.X;
-    }
-    if (data.Position.Z > 1280 && this.cursor.isVisible) {
-      this.cursor.forceAnimateGlyphs = true;
-      const currentPosition = this.cursor.position;
-      this.cursor.position = currentPosition;
-      console.log('Do force');
+    this.resetInfo();
+
+    if (info.length > 0) {
+      info.forEach((i, idx) => this.showInfo(i, idx));
+
+      info.forEach((i, idx) => console.log(i, idx));
     }
 
-    if (this.cursor.isVisible) {
-      return; // no zoom when lense is active
-    }
+    if (zoom) {
+      const strength = zoom.mode === TouchInteractionMode.ZoomIn ? zoom.strength : -zoom.strength;
+      this.updateZoom(strength, zoom.originalPoint.Position.X, zoom.originalPoint.Position.Y);
 
-    const zoomFactor = data.Position.Z > 1500 ? 0.95 : data.Position.Z < 1200 ? 1.05 : 1;
-    // const zoomFactor = data.Position.Z < -0.5 ? 1.05 : data.Position.Z > 0.5 ? 0.95 : 1;
-    const trans = this.component.configuration.zoomIdentity;
-    trans.k = trans.k * zoomFactor;
-    // trans.x = (this.component.width / 2 - 10) - ((this.component.width / 2 - 10) * trans.k);
-    // trans.y = (this.component.height / 2 - 130) - ((this.component.height / 2 - 130) * trans.k);
-
-    trans.x = (this.component.width / 2 - 50) - ((this.component.width / 2 - 50) * trans.k);
-    trans.y = (this.component.height / 2 + 80) - ((this.component.height / 2 + 80) * trans.k);
-
-    if (trans.k < 1 || trans.k > 40) {
       return;
     }
 
+    if (anchor && target) {
+      this.updateTranslation(anchor, target, target.strength);
+
+      return;
+    }
+
+    // if(!this.isReset && interactions.length > 0 && interactions[0].originalPoint.Position.Z > 0) {
+    //   this.resetTransformation();
+
+    //   return;
+    // }
+
+    this.lastInteraction = TouchInteractionMode.None;
+  }
+
+  private updateZoom(interactionStrength: number, x: number, y: number) : void {
+    const screenOffset = { x: this.component.width * x, y: this.component.height * y};
+
+    const wheelEvent = new WheelEvent('wheel', {
+      deltaY: interactionStrength * this.wheelModifier,
+      clientX: screenOffset.x,
+      clientY: screenOffset.y
+    });
+
+    this.component.chartContainer?.nativeElement.dispatchEvent(wheelEvent);
+
+    this.lastInteraction = interactionStrength > 0 ? TouchInteractionMode.ZoomIn : TouchInteractionMode.ZoomOut;
+  }
+
+  private updateTranslation(anchor: InteractiveTouchPoint, target: InteractiveTouchPoint, interactionStrength: number) : void {
+    this.isReset = false;
+
+    const dirX = target.originalPoint.Position.X - anchor.originalPoint.Position.X;
+    const dirY = target.originalPoint.Position.Y - anchor.originalPoint.Position.Y;
+
+    const l = Math.sqrt(dirX * dirX + dirY * dirY);
+
+    const dirX_norm = dirX/l * this.panningSpeed;
+    const dirY_norm = dirY/l * this.panningSpeed;
+
+    const trans = this.component.configuration.zoomIdentity;
+    trans.x = trans.x + dirX_norm * interactionStrength;
+    trans.y = trans.y + dirY_norm * interactionStrength;
+
+
     this.component.configuration.zoomIdentity = trans;
-    // this.logger.log('FlexTransform: ' + this.component.transform);
+
+    this.component.updateGlyphLayout();
     this.configuration.updateCurrentLevelOfDetail(this.component.configuration.zoomIdentity.k);
     this.configuration.currentLayout = GlyphLayout.Cluster;
+    this.component.animate();
+  }
+
+  private showInfo(target: InteractiveTouchPoint, idx: number) {
+    const all = this.component.allToolTips;
+
+    if (all.length <= idx) {
+      return;
+    }
+
+    const tooltip = all[idx];
+    if (!tooltip) {
+      return;
+    }
+
+
+    tooltip.tolerance = 20;
+
+    const screenOffset = { x: this.component.width * target.originalPoint.Position.X, y: this.component.height * target.originalPoint.Position.Y};
+
+    const moveEvent = new MouseEvent('mousemove', {
+      clientX: screenOffset.x,
+      clientY: screenOffset.y
+    });
+
+    tooltip.updateClosestPoint(moveEvent, this.component.configuration.zoomIdentity);
+  }
+
+  private resetInfo() {
+    const all = this.component.allToolTips;
+
+    all.forEach((tooltip) => {
+
+      if (!tooltip) {
+        return;
+      }
+
+      tooltip.isVisible = false;
+    });
+  }
+
+  private resetTransformation(): void {
+    this.isReset = true;
+
+    this.component.configuration.zoomIdentity = d3.zoomIdentity;
+
+    this.configuration.updateCurrentLevelOfDetail(this.component.configuration.zoomIdentity.k);
+    this.configuration.levelChanged();
+    this.component.updateGlyphLayout(true);
     this.component.animate();
   }
 }

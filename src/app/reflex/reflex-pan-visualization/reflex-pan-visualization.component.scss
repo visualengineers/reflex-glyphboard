@@ -1,0 +1,16 @@
+:host {
+  position: absolute;
+}
+
+.touch-point {
+  &__pan-visualization {
+    position: absolute;
+      width: 186px;
+      height: 95px;
+
+      top: -47px;
+      left: 0px;
+
+      transform-origin: left center;
+  }
+}
